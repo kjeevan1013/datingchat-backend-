@@ -1,15 +1,17 @@
 {
   "name": "datingchat-backend",
   "version": "1.0.0",
-  "description": "Self-hosted backend for DatingChat Android app.",
+  "description": "Self-hosted backend for DatingChat Android app (no Firebase). REST auth/search/profile + WebSocket real-time chat.",
   "main": "server.js",
   "scripts": {
+    "postinstall": "npm rebuild",
     "start": "node server.js"
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "dependencies": {
+    "pg": "^8.12.0",
     "better-sqlite3": "^11.3.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",

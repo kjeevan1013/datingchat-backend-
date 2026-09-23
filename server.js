@@ -18,7 +18,7 @@ app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// ---------- File upload (profile pictures) ----------
+// ---------- File upload (profile pictures & chat media) ----------
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
@@ -43,7 +43,7 @@ function publicUser(row) {
 }
 
 // ---------- AUTH ----------
-app.post('/auth/register', (req, res) => {
+app.post('/auth/register', async (req, res) => {
   const { username, email, password } = req.body || {};
   if (!username || !email || !password) {
     return res.status(400).json({ error: 'username, email and password are required' });
@@ -51,70 +51,53 @@ app.post('/auth/register', (req, res) => {
   if (password.length < 6) {
     return res.status(400).json({ error: 'Password must be at least 6 characters' });
   }
-  const existing = db.prepare('SELECT id FROM users WHERE username = ? OR email = ?')
-    .get(username.toLowerCase(), email.toLowerCase());
-  if (existing) return res.status(409).json({ error: 'Username or email already taken' });
+  const existingByUsername = await db.findUserByUsernameOrEmail(username);
+  const existingByEmail = await db.findUserByUsernameOrEmail(email);
+  if (existingByUsername || existingByEmail) {
+    return res.status(409).json({ error: 'Username or email already taken' });
+  }
 
   const id = uuid();
   const hash = bcrypt.hashSync(password, 10);
-  db.prepare(`INSERT INTO users (id, username, email, password_hash, created_at)
-              VALUES (?, ?, ?, ?, ?)`)
-    .run(id, username.toLowerCase(), email.toLowerCase(), hash, Date.now());
+  await db.createUser({ id, username, email, password_hash: hash, created_at: Date.now() });
 
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  const user = await db.getUserById(id);
   res.json({ token: signToken(id), user: publicUser(user) });
 });
 
-app.post('/auth/login', (req, res) => {
-  const { identifier, password } = req.body || {}; // identifier = username or email
+app.post('/auth/login', async (req, res) => {
+  const { identifier, password } = req.body || {};
   if (!identifier || !password) return res.status(400).json({ error: 'identifier and password are required' });
 
-  const user = db.prepare('SELECT * FROM users WHERE username = ? OR email = ?')
-    .get(identifier.toLowerCase(), identifier.toLowerCase());
+  const user = await db.findUserByUsernameOrEmail(identifier);
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
   res.json({ token: signToken(user.id), user: publicUser(user) });
 });
 
-app.get('/auth/me', requireAuth, (req, res) => {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+app.get('/auth/me', requireAuth, async (req, res) => {
+  const user = await db.getUserById(req.userId);
+  if (!user) return res.status(401).json({ error: 'User not found' });
   res.json(publicUser(user));
 });
 
 // ---------- USERS / SEARCH ----------
-// Search by username OR email (exact or partial match), excludes self.
-app.get('/users/search', requireAuth, (req, res) => {
-  const q = String(req.query.q || '').trim().toLowerCase();
-  let rows;
-  if (!q) {
-    rows = db.prepare(`
-      SELECT * FROM users
-      WHERE id != ?
-      ORDER BY created_at DESC
-      LIMIT 25
-    `).all(req.userId);
-  } else {
-    rows = db.prepare(`
-      SELECT * FROM users
-      WHERE (LOWER(username) LIKE ? OR LOWER(email) LIKE ?) AND id != ?
-      ORDER BY username ASC
-      LIMIT 25
-    `).all(`%${q}%`, `%${q}%`, req.userId);
-  }
+app.get('/users/search', requireAuth, async (req, res) => {
+  const rows = await db.searchUsers(req.query.q, req.userId);
   res.json(rows.map(publicUser));
 });
 
-app.get('/users/:id', requireAuth, (req, res) => {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+app.get('/users/:id', requireAuth, async (req, res) => {
+  const user = await db.getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'Not found' });
   res.json(publicUser(user));
 });
 
-app.post('/users/me/avatar', requireAuth, upload.single('avatar'), (req, res) => {
+app.post('/users/me/avatar', requireAuth, upload.single('avatar'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   const url = `/uploads/${req.file.filename}`;
-  db.prepare('UPDATE users SET avatar_url = ? WHERE id = ?').run(url, req.userId);
+  await db.updateUserAvatar(req.userId, url);
   res.json({ avatarUrl: url });
 });
 
@@ -126,53 +109,32 @@ app.post('/chats/upload', requireAuth, upload.single('file'), (req, res) => {
   res.json({ mediaUrl: url, mediaType: isVideo ? 'video' : 'image' });
 });
 
-app.patch('/users/me', requireAuth, (req, res) => {
+app.patch('/users/me', requireAuth, async (req, res) => {
   const { bio } = req.body || {};
   if (typeof bio === 'string') {
-    db.prepare('UPDATE users SET bio = ? WHERE id = ?').run(bio, req.userId);
+    await db.updateUserBio(req.userId, bio);
   }
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+  const user = await db.getUserById(req.userId);
   res.json(publicUser(user));
 });
 
 // ---------- CHATS ----------
-function chatIdFor(a, b) {
-  const [x, y] = [a, b].sort();
-  return `${x}_${y}`;
-}
-
-function getOrCreateChat(userA, userB) {
-  const id = chatIdFor(userA, userB);
-  const existing = db.prepare('SELECT * FROM chats WHERE id = ?').get(id);
-  if (existing) return existing;
-  const [x, y] = [userA, userB].sort();
-  db.prepare('INSERT INTO chats (id, user_a, user_b, created_at) VALUES (?, ?, ?, ?)')
-    .run(id, x, y, Date.now());
-  return db.prepare('SELECT * FROM chats WHERE id = ?').get(id);
-}
-
-// Start (or fetch) a chat with another user by their id — used after a search result is tapped.
-app.post('/chats/with/:userId', requireAuth, (req, res) => {
-  const other = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.userId);
+app.post('/chats/with/:userId', requireAuth, async (req, res) => {
+  const other = await db.getUserById(req.params.userId);
   if (!other) return res.status(404).json({ error: 'User not found' });
-  const chat = getOrCreateChat(req.userId, other.id);
+  const chat = await db.getOrCreateChat(req.userId, other.id);
   res.json({ chatId: chat.id, otherUser: publicUser(other) });
 });
 
-// List all chats for the logged-in user, with last message + other user info.
-app.get('/chats', requireAuth, (req, res) => {
-  const chats = db.prepare('SELECT * FROM chats WHERE user_a = ? OR user_b = ?')
-    .all(req.userId, req.userId);
+app.get('/chats', requireAuth, async (req, res) => {
+  const chats = await db.getChatsForUser(req.userId);
 
-  const result = chats.map(chat => {
+  const result = await Promise.all(chats.map(async chat => {
     const otherId = chat.user_a === req.userId ? chat.user_b : chat.user_a;
-    const other = db.prepare('SELECT * FROM users WHERE id = ?').get(otherId);
-    const lastMsg = db.prepare(`
-      SELECT * FROM messages WHERE chat_id = ? AND deleted_for_everyone = 0
-      ORDER BY created_at DESC LIMIT 1
-    `).get(chat.id);
+    const other = await db.getUserById(otherId);
+    const lastMsg = await db.getLastMessageForChat(chat.id);
 
-    const createdAt = lastMsg ? lastMsg.created_at : chat.created_at;
+    const createdAt = lastMsg ? Number(lastMsg.created_at) : Number(chat.created_at);
     let text = lastMsg ? lastMsg.text : null;
     if (lastMsg && !text) {
       if (lastMsg.media_type === 'video') text = '🎥 Video';
@@ -187,18 +149,18 @@ app.get('/chats', requireAuth, (req, res) => {
       } : null,
       updatedAt: createdAt
     };
-  }).filter(c => c.otherUser != null)
+  }));
+
+  const visibleChats = result.filter(c => c.otherUser != null)
     .sort((a, b) => b.updatedAt - a.updatedAt);
 
-  res.json(result);
+  res.json(visibleChats);
 });
 
-// Message history for a chat (skips messages deleted-for-me by this user, and deleted-for-everyone).
-app.get('/chats/:chatId/messages', requireAuth, (req, res) => {
-  const rows = db.prepare('SELECT * FROM messages WHERE chat_id = ? ORDER BY created_at ASC')
-    .all(req.params.chatId);
+app.get('/chats/:chatId/messages', requireAuth, async (req, res) => {
+  const rows = await db.getMessagesForChat(req.params.chatId);
   const visible = rows.filter(m => {
-    const deletedFor = m.deleted_for ? m.deleted_for.split(',') : [];
+    const deletedFor = m.deleted_for ? String(m.deleted_for).split(',') : [];
     return !deletedFor.includes(req.userId);
   }).map(m => ({
     id: m.id,
@@ -208,27 +170,26 @@ app.get('/chats/:chatId/messages', requireAuth, (req, res) => {
     mediaUrl: m.deleted_for_everyone ? null : (m.media_url || null),
     mediaType: m.deleted_for_everyone ? null : (m.media_type || null),
     deletedForEveryone: !!m.deleted_for_everyone,
-    createdAt: m.created_at,
+    createdAt: Number(m.created_at),
     status: m.status
   }));
   res.json(visible);
 });
 
-// Delete a message: forEveryone=true (only sender may do this) or delete-for-me.
-app.post('/messages/:id/delete', requireAuth, (req, res) => {
+app.post('/messages/:id/delete', requireAuth, async (req, res) => {
   const { forEveryone } = req.body || {};
-  const msg = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
+  const msg = await db.getMessageById(req.params.id);
   if (!msg) return res.status(404).json({ error: 'Not found' });
 
   if (forEveryone) {
     if (msg.sender_id !== req.userId) return res.status(403).json({ error: 'Only the sender can delete for everyone' });
-    db.prepare('UPDATE messages SET deleted_for_everyone = 1, text = ? WHERE id = ?').run('', msg.id);
+    await db.updateMessageDeletedForEveryone(msg.id);
   } else {
-    const current = msg.deleted_for ? msg.deleted_for.split(',') : [];
+    const current = msg.deleted_for ? String(msg.deleted_for).split(',') : [];
     if (!current.includes(req.userId)) current.push(req.userId);
-    db.prepare('UPDATE messages SET deleted_for = ? WHERE id = ?').run(current.join(','), msg.id);
+    await db.updateMessageDeletedFor(msg.id, current.join(','));
   }
-  broadcastToChat(msg.chat_id, { type: 'message_deleted', messageId: msg.id, forEveryone: !!forEveryone });
+  await broadcastToChat(msg.chat_id, { type: 'message_deleted', messageId: msg.id, forEveryone: !!forEveryone });
   res.json({ ok: true });
 });
 
@@ -236,11 +197,10 @@ app.post('/messages/:id/delete', requireAuth, (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-// userId -> Set of live sockets (a user might have the app open on multiple devices)
 const liveSockets = new Map();
 
-function broadcastToChat(chatId, payload) {
-  const chat = db.prepare('SELECT * FROM chats WHERE id = ?').get(chatId);
+async function broadcastToChat(chatId, payload) {
+  const chat = await db.getChatById(chatId);
   if (!chat) return;
   [chat.user_a, chat.user_b].forEach(uid => {
     const sockets = liveSockets.get(uid);
@@ -261,7 +221,7 @@ wss.on('connection', (ws, req) => {
   if (!liveSockets.has(userId)) liveSockets.set(userId, new Set());
   liveSockets.get(userId).add(ws);
 
-  ws.on('message', raw => {
+  ws.on('message', async raw => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
@@ -269,7 +229,7 @@ wss.on('connection', (ws, req) => {
       const { chatId, text, mediaUrl, mediaType } = data;
       if (!chatId) return;
       if (!text && !mediaUrl) return;
-      const chat = db.prepare('SELECT * FROM chats WHERE id = ?').get(chatId);
+      const chat = await db.getChatById(chatId);
       if (!chat || (chat.user_a !== userId && chat.user_b !== userId)) return;
 
       const msg = {
@@ -279,11 +239,9 @@ wss.on('connection', (ws, req) => {
         media_type: mediaType || null,
         created_at: Date.now(), deleted_for_everyone: 0, deleted_for: '', status: 'sent'
       };
-      db.prepare(`INSERT INTO messages (id, chat_id, sender_id, text, media_url, media_type, created_at, deleted_for_everyone, deleted_for, status)
-                  VALUES (@id, @chat_id, @sender_id, @text, @media_url, @media_type, @created_at, @deleted_for_everyone, @deleted_for, @status)`)
-        .run(msg);
+      await db.createMessage(msg);
 
-      broadcastToChat(chatId, {
+      await broadcastToChat(chatId, {
         type: 'new_message',
         message: {
           id: msg.id, chatId, senderId: userId, text: msg.text,
@@ -294,7 +252,7 @@ wss.on('connection', (ws, req) => {
     }
 
     if (data.type === 'typing') {
-      broadcastToChat(data.chatId, { type: 'typing', chatId: data.chatId, userId });
+      await broadcastToChat(data.chatId, { type: 'typing', chatId: data.chatId, userId });
     }
   });
 
@@ -304,6 +262,13 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`DatingChat backend running on http://0.0.0.0:${PORT}  (WebSocket at /ws)`);
+async function startServer() {
+  await db.init();
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`DatingChat backend running on http://0.0.0.0:${PORT} (WebSocket at /ws)`);
+  });
+}
+
+startServer().catch(err => {
+  console.error('Failed to start server:', err);
 });
