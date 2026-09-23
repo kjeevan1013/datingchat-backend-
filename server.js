@@ -86,12 +86,22 @@ app.get('/auth/me', requireAuth, (req, res) => {
 // Search by username OR email (exact or partial match), excludes self.
 app.get('/users/search', requireAuth, (req, res) => {
   const q = String(req.query.q || '').trim().toLowerCase();
-  if (!q) return res.json([]);
-  const rows = db.prepare(`
-    SELECT * FROM users
-    WHERE (username LIKE ? OR email LIKE ?) AND id != ?
-    LIMIT 25
-  `).all(`%${q}%`, `%${q}%`, req.userId);
+  let rows;
+  if (!q) {
+    rows = db.prepare(`
+      SELECT * FROM users
+      WHERE id != ?
+      ORDER BY created_at DESC
+      LIMIT 25
+    `).all(req.userId);
+  } else {
+    rows = db.prepare(`
+      SELECT * FROM users
+      WHERE (LOWER(username) LIKE ? OR LOWER(email) LIKE ?) AND id != ?
+      ORDER BY username ASC
+      LIMIT 25
+    `).all(`%${q}%`, `%${q}%`, req.userId);
+  }
   res.json(rows.map(publicUser));
 });
 
@@ -161,14 +171,24 @@ app.get('/chats', requireAuth, (req, res) => {
       SELECT * FROM messages WHERE chat_id = ? AND deleted_for_everyone = 0
       ORDER BY created_at DESC LIMIT 1
     `).get(chat.id);
+
+    const createdAt = lastMsg ? lastMsg.created_at : chat.created_at;
+    let text = lastMsg ? lastMsg.text : null;
+    if (lastMsg && !text) {
+      if (lastMsg.media_type === 'video') text = '🎥 Video';
+      else if (lastMsg.media_type === 'image' || lastMsg.media_url) text = '📷 Photo';
+    }
+
     return {
       chatId: chat.id,
       otherUser: publicUser(other),
       lastMessage: lastMsg ? {
-        id: lastMsg.id, text: lastMsg.text, senderId: lastMsg.sender_id, createdAt: lastMsg.created_at
-      } : null
+        id: lastMsg.id, text, senderId: lastMsg.sender_id, createdAt
+      } : null,
+      updatedAt: createdAt
     };
-  }).sort((a, b) => (b.lastMessage?.createdAt || 0) - (a.lastMessage?.createdAt || 0));
+  }).filter(c => c.otherUser != null)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
 
   res.json(result);
 });
