@@ -37,4 +37,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id);
 `);
 
+try { db.exec("ALTER TABLE messages ADD COLUMN media_url TEXT;"); } catch (_) {}
+try { db.exec("ALTER TABLE messages ADD COLUMN media_type TEXT;"); } catch (_) {}
+
 module.exports = db;

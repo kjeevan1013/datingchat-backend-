@@ -26,10 +26,10 @@ const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadDir),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname) || '.jpg';
-    cb(null, `${req.userId}-${Date.now()}${ext}`);
+    cb(null, `${req.userId || 'media'}-${Date.now()}${ext}`);
   }
 });
-const upload = multer({ storage, limits: { fileSize: 5 * 1024 * 1024 } });
+const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
 
 function publicUser(row) {
   if (!row) return null;
@@ -108,6 +108,14 @@ app.post('/users/me/avatar', requireAuth, upload.single('avatar'), (req, res) =>
   res.json({ avatarUrl: url });
 });
 
+app.post('/chats/upload', requireAuth, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  const url = `/uploads/${req.file.filename}`;
+  const isVideo = (req.file.mimetype && req.file.mimetype.startsWith('video/')) ||
+                  /\.(mp4|mov|avi|mkv|webm|3gp)$/i.test(req.file.filename);
+  res.json({ mediaUrl: url, mediaType: isVideo ? 'video' : 'image' });
+});
+
 app.patch('/users/me', requireAuth, (req, res) => {
   const { bio } = req.body || {};
   if (typeof bio === 'string') {
@@ -177,6 +185,8 @@ app.get('/chats/:chatId/messages', requireAuth, (req, res) => {
     chatId: m.chat_id,
     senderId: m.sender_id,
     text: m.deleted_for_everyone ? null : m.text,
+    mediaUrl: m.deleted_for_everyone ? null : (m.media_url || null),
+    mediaType: m.deleted_for_everyone ? null : (m.media_type || null),
     deletedForEveryone: !!m.deleted_for_everyone,
     createdAt: m.created_at,
     status: m.status
@@ -236,22 +246,30 @@ wss.on('connection', (ws, req) => {
     try { data = JSON.parse(raw); } catch { return; }
 
     if (data.type === 'send_message') {
-      const { chatId, text } = data;
-      if (!chatId || !text || !text.trim()) return;
+      const { chatId, text, mediaUrl, mediaType } = data;
+      if (!chatId) return;
+      if (!text && !mediaUrl) return;
       const chat = db.prepare('SELECT * FROM chats WHERE id = ?').get(chatId);
       if (!chat || (chat.user_a !== userId && chat.user_b !== userId)) return;
 
       const msg = {
-        id: uuid(), chat_id: chatId, sender_id: userId, text: text.trim(),
+        id: uuid(), chat_id: chatId, sender_id: userId,
+        text: text && text.trim() ? text.trim() : null,
+        media_url: mediaUrl || null,
+        media_type: mediaType || null,
         created_at: Date.now(), deleted_for_everyone: 0, deleted_for: '', status: 'sent'
       };
-      db.prepare(`INSERT INTO messages (id, chat_id, sender_id, text, created_at, deleted_for_everyone, deleted_for, status)
-                  VALUES (@id, @chat_id, @sender_id, @text, @created_at, @deleted_for_everyone, @deleted_for, @status)`)
+      db.prepare(`INSERT INTO messages (id, chat_id, sender_id, text, media_url, media_type, created_at, deleted_for_everyone, deleted_for, status)
+                  VALUES (@id, @chat_id, @sender_id, @text, @media_url, @media_type, @created_at, @deleted_for_everyone, @deleted_for, @status)`)
         .run(msg);
 
       broadcastToChat(chatId, {
         type: 'new_message',
-        message: { id: msg.id, chatId, senderId: userId, text: msg.text, createdAt: msg.created_at, status: 'sent' }
+        message: {
+          id: msg.id, chatId, senderId: userId, text: msg.text,
+          mediaUrl: msg.media_url, mediaType: msg.media_type,
+          createdAt: msg.created_at, status: 'sent'
+        }
       });
     }
 
